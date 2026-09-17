@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 import streamlit as st
 
 from core.backtest import run_backtest
@@ -19,17 +21,25 @@ st.set_page_config(
 )
 
 
-DEFAULTS = {
-    "ticker": "QQQ",
-    "start_date": date(2010, 1, 1),
-    "end_date": date.today(),
-    "ma_months": 10,
-    "initial_amount": 10_000_000.0,
-    "use_contribution": False,
-    "contribution_amount": 1_000_000.0,
-    "contribution_frequency": "매월",
-}
+def build_defaults() -> dict:
+    # Streamlit Cloud servers may run in UTC; use Korea local date for "today".
+    default_end = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    default_start = default_end - relativedelta(years=10)
+    return {
+        "ticker": "QQQ",
+        "start_date": default_start,
+        "end_date": default_end,
+        "ma_months": 10,
+        "confirmation_count": 1,
+        "signal_limit_days": 5,
+        "initial_amount": 10_000_000.0,
+        "use_contribution": False,
+        "contribution_amount": 1_000_000.0,
+        "contribution_frequency": "매월",
+    }
 
+
+DEFAULTS = build_defaults()
 INPUT_KEYS = list(DEFAULTS.keys())
 
 
@@ -42,7 +52,8 @@ def initialize_state() -> None:
 
 
 def reset_inputs() -> None:
-    for key, value in DEFAULTS.items():
+    # Rebuild defaults so "today" is always current when reset is pressed.
+    for key, value in build_defaults().items():
         st.session_state[key] = value
     st.session_state.pop("backtest_output", None)
     st.session_state.pop("backtest_context", None)
@@ -66,15 +77,15 @@ def money(value: float) -> str:
 def show_input_page() -> None:
     st.title("📈 이동평균 투자전략 백테스트")
     st.write(
-        "종가가 이동평균 위에 있으면 주식을 보유하고, 아래에 있으면 현금을 보유하는 전략을 테스트합니다."
+        "종가와 이동평균의 BUY/SELL 시그널을 확인하고, 확인 횟수와 대기 LIMIT 규칙에 따라 포지션을 전환하는 전략을 테스트합니다."
     )
-    st.caption("v1 기준: N개월 = N × 21거래일 단순이동평균(SMA), 당일 종가 체결, 수수료·세금·환율 미반영")
+    st.caption("N개월 = N × 21거래일 단순이동평균(SMA), 확인 횟수/LIMIT 충족 시 당일 종가 체결, 수수료·세금·환율 미반영")
 
     st.divider()
 
     st.subheader("조건 입력")
 
-    ticker_col, ma_col = st.columns([2, 1])
+    ticker_col, ma_col, confirmation_col, limit_col = st.columns([2, 1, 1, 1])
     with ticker_col:
         st.text_input(
             "종목 티커",
@@ -88,6 +99,27 @@ def show_input_page() -> None:
             max_value=60,
             step=1,
             key="ma_months",
+        )
+    with confirmation_col:
+        st.number_input(
+            "포지션 변경 확인 횟수",
+            min_value=1,
+            max_value=30,
+            step=1,
+            key="confirmation_count",
+            help="현재 포지션의 반대 방향 시그널이 몇 번 확인되면 실제 포지션을 변경할지 정합니다.",
+        )
+    with limit_col:
+        st.number_input(
+            "시그널 대기 LIMIT (거래일)",
+            min_value=1,
+            max_value=252,
+            step=1,
+            key="signal_limit_days",
+            help=(
+                "같은 방향 시그널이 확인된 뒤 다음 같은 방향 시그널을 기다리는 최대 거래일 수입니다. "
+                "반대 시그널이 나오면 대기 상태가 초기화되고, LIMIT까지 반대 시그널이 없으면 현재 누적 횟수로 포지션을 변경합니다."
+            ),
         )
 
     start_col, end_col = st.columns(2)
@@ -168,6 +200,8 @@ def show_input_page() -> None:
                     use_contribution=bool(st.session_state.use_contribution),
                     contribution_amount=float(st.session_state.contribution_amount),
                     contribution_frequency=st.session_state.contribution_frequency,
+                    confirmation_count=int(st.session_state.confirmation_count),
+                    signal_limit_days=int(st.session_state.signal_limit_days),
                 )
             except Exception as exc:
                 st.error(str(exc))
@@ -197,6 +231,8 @@ def show_result_page() -> None:
     png_bytes = create_result_png(
         ticker=ticker,
         ma_months=int(context["ma_months"]),
+        confirmation_count=int(context["confirmation_count"]),
+        signal_limit_days=int(context["signal_limit_days"]),
         requested_start=context["start_date"],
         requested_end=context["end_date"],
         initial_amount=float(context["initial_amount"]),
@@ -218,14 +254,19 @@ def show_result_page() -> None:
         st.download_button(
             "결과 이미지 저장",
             data=png_bytes,
-            file_name=f"{ticker}_MA{int(context['ma_months'])}_backtest.png",
+            file_name=(
+                f"{ticker}_MA{int(context['ma_months'])}_"
+                f"C{int(context['confirmation_count'])}_L{int(context['signal_limit_days'])}_backtest.png"
+            ),
             mime="image/png",
             use_container_width=True,
         )
 
     st.title(f"{ticker} 백테스트 결과")
     st.caption(
-        f"{context['start_date']} ~ {context['end_date']} · {int(context['ma_months'])}개월 이동평균 · 당일 종가 체결"
+        f"{context['start_date']} ~ {context['end_date']} · {int(context['ma_months'])}개월 이동평균 · "
+        f"포지션 변경 확인 {int(context['confirmation_count'])}회 · "
+        f"시그널 대기 LIMIT {int(context['signal_limit_days'])}거래일 · 당일 종가 체결"
     )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -236,9 +277,9 @@ def show_result_page() -> None:
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("MDD", f"{metrics['mdd_pct']:.2f}%")
-    c6.metric("Buy & Hold 최종", money(metrics["buy_hold_final_value"]))
-    c7.metric("매수 실행", f"{metrics['buy_count']}회")
-    c8.metric("매도 실행", f"{metrics['sell_count']}회")
+    c6.metric(f"{ticker} 최종", money(metrics["buy_hold_final_value"]))
+    c7.metric("매수 전환", f"{metrics['buy_count']}회")
+    c8.metric("매도 전환", f"{metrics['sell_count']}회")
 
     st.caption(
         f"실제 첫 거래일: {metrics['effective_start_date']} · 종료 포지션: {metrics['ending_position']} · "
@@ -252,7 +293,7 @@ def show_result_page() -> None:
     )
 
     st.plotly_chart(
-        portfolio_chart(daily, float(context["initial_amount"])),
+        portfolio_chart(daily, float(context["initial_amount"]), ticker),
         use_container_width=True,
     )
 
