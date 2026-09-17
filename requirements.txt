@@ -1,0 +1,7 @@
+streamlit>=1.48,<2
+yfinance>=0.2.54
+pandas>=2.2
+numpy>=2.0
+python-dateutil>=2.9
+plotly>=6.0
+matplotlib>=3.9
